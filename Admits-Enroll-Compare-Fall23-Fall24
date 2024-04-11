@@ -1,1 +1,79 @@
+--EN100 & EN140 for AY22 and AY23: DFW RATE based on student populations, course modality, and instructor type
+
+    --Ranking to label course attribution 
+With course_type_rank as (
+Select crn_key
+        ,term_code_key
+        , min(course_rank) as course_type_rank
+from (
+Select  ahd.crn_key 
+        ,ahd.term_code_key
+        ,CASE
+        WHEN asa.ssrattr_attr_code = 'ONL' THEN 1 --web
+        WHEN asa.ssrattr_attr_code LIKE 'OL%' THEN 2 --blended
+        WHEN asa.ssrattr_attr_code not in ('ONL', 'FLEX') OR asa.ssrattr_attr_code NOT LIKE 'OL%' OR asa.ssrattr_attr_code NOT LIKE 'BF%' THEN 4 --f2f
+        WHEN asa.ssrattr_attr_code = 'FLEX' OR asa.ssrattr_attr_code LIKE 'BF%' THEN 3 --hyflex
+        ELSE ''
+        END AS Course_Rank
+from source.frozen_enrollment.academic_history_detail ahd
+inner join source.bannerreporting.as_section_attributes asa on asa.ssrattr_crn = ahd.crn_key and asa.ssrattr_term_code = ahd.term_code_key
+)
+group by crn_key
+        ,term_code_key
+),
+    --List of students that took EN100/EN140 during 201910-202330 
+EN100_140 as (
+Select * from (
+Select distinct 
+        ahd.pidm_key
+        ,ahd.term_code_key
+        ,ahd.term_desc
+        ,ahd.crn_key
+        ,concat(ahd.subj_code, ahd.crse_number) AS EN_course
+        ,IFF(grde_code_final in ('D', 'F', 'W'), 'DFW', 'Non-DFW') AS EN_Grade --label grade in EN100/EN140 as DFW or Non-DFW
+        ,count(ahd.crn_key) over (partition by ahd.pidm_key, ahd.term_code_key) as total_class_taken --count numbers of class taken in a semester
+        ,SUM(IFF(ahd.grde_code_final in ('D', 'F', 'W'), 1, 0)) over (partition by ahd.pidm_key, ahd.term_code_key) as total_DFW --count numbers of DFW in a semester
+        ,ahd.camp_code_desc
+        ,zcs.primary_instructor_id
+        ,azp.adm_full_name_fmil AS Instructor_Fullname
+        ,dsh.fulltime_ind
+        ,(TO_DATE(vdt.term_start_date) - TO_DATE(ahd.birth_date))/365 AS AGE
+        , CASE
+            WHEN ctr.course_type_rank = 1 THEN 'Web'
+            WHEN ctr.course_type_rank = 2 THEN 'Blended'
+            WHEN ctr.course_type_rank = 3 THEN 'Hyflex' 
+            WHEN ctr.course_type_rank = 4 THEN 'F2F'
+            ELSE ''
+            END AS Course_Type 
+        ,SUM(ahd.credit_hours) OVER (PARTITION BY ahd.pidm_key, ahd.term_code_key) as Total_Cred_Semester
+        ,CASE
+            WHEN dsh.fulltime_ind is not null THEN dsh.fulltime_ind
+            WHEN dsh.fulltime_ind is null and ahd.term_code_key Like '%30' and Total_Cred_Semester >=9 THEN True
+            WHEN dsh.fulltime_ind is null and ahd.term_code_key Not Like '%30' and Total_Cred_Semester >=12 THEN True
+            ELSE False 
+        END AS FULLTIME_INDICATOR
+        ,IFF(dsh.styp_code = 'N' and fulltime_indicator = True, True, False) AS FTFTF_IND
+        ,IFF((TO_DATE(vdt.term_start_date) - TO_DATE(ahd.birth_date))/365 < 24, True, False) AS TRADITIONAL_IND
+from source.frozen_enrollment.academic_history_detail ahd
+inner join source.bannerreporting.as_z_catalog_schedule zcs on zcs.term_code_key = ahd.term_code_key and zcs.crn_key = ahd.crn_key 
+inner join source.bannerreporting.as_z_person azp on azp.id_number = zcs.primary_instructor_id
+inner join v_dim_term vdt on vdt.term_code_key = ahd.term_code_key 
+left join course_type_rank ctr on ctr.crn_key = ahd.crn_key and ctr.term_code_key = ahd.term_code_key
+left join v_dim_student_history dsh on dsh.pidm_key = ahd.pidm_key and dsh.term_code_key = ahd.term_code_key
+where ahd.term_code_key between 201910 and 202330 
+)
+where EN_course in ('EN100', 'EN140')
+)
+Select DISTINCT EN100_140.*
+         ,IFF(Total_Class_Taken = Total_DFW, 'ALL_DFW', 'NOT_ALL_DFW') AS ALL_DFW_IND
+         ,SUM(IFF(EN_GRADE = 'DFW', 1, 0)) over (partition by pidm_key, term_code_key, EN_COURSE) AS EN_DFW_Count
+         ,IFF(EN_GRADE = 'DFW' and EN_DFW_Count = Total_DFW, 'Only_EN_DFW', 'Not_Only_DFW') AS ONLY_EN_DFW_IND
+from EN100_140 
+
+Select * from source.frozen_enrollment.academic_history_detail where pidm_key = 993287
+
+Select pidm_key, term_code_key, count(crn_key)
+from source.frozen_enrollment.academic_history_detail
+where term_code_key between 201910 and 202330 
+group by pidm_key, ahd.term_code_key
 
