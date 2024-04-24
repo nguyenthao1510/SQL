@@ -1,0 +1,541 @@
+--these will become parameters in SSRS report
+DECLARE @UpcomingTerm AS varchar(6) = '202510';
+DECLARE @Date AS varchar(5) = '04-15';
+
+--find the first start date of recording admission of the previous year 
+WITH MIN_DATE_PREVIOUS_YEAR AS (
+    SELECT DISTINCT 
+                    term_code_key,
+                    Format(MIN(SnapshotDate), 'MM-dd') as MinSnapshotMonthDay
+     FROM [Enroll_Snapshot].[dbo].[DailyStudent]
+     WHERE TERM_CODE_KEY = @UpcomingTerm - 100
+     group by term_code_key
+),
+
+--union table: when the min(date) of last year is less than chosen date of tracking term
+--and when the min(date) of this year is less than chosen date of tracking term 
+DAILY_SNAPSHOT AS (
+    --when the date for admission tracking of the previous year is greater than the selected tracking day 
+    --for the upcoming term -> snapshotdate = MinSnapshotMonthDay
+SELECT distinct [Enroll_Snapshot].[dbo].[DailyStudent].*
+FROM [Enroll_Snapshot].[dbo].[DailyStudent]
+INNER JOIN MIN_DATE_PREVIOUS_YEAR ON 
+    MIN_DATE_PREVIOUS_YEAR.TERM_CODE_KEY = [Enroll_Snapshot].[dbo].[DailyStudent].TERM_CODE_KEY
+WHERE MinSnapshotMonthDay >= @Date and MinSnapshotMonthDay = Format(SnapshotDate, 'MM-dd')
+
+UNION 
+    -- when the date for admission tracking of the previous year is less than the selected tracking day 
+    -- for the upcoming term -> snapshotdate = max(snapshotdate) of the previous semester 
+SELECT distinct [Enroll_Snapshot].[dbo].[DailyStudent].*
+FROM [Enroll_Snapshot].[dbo].[DailyStudent]
+INNER JOIN MIN_DATE_PREVIOUS_YEAR ON 
+    MIN_DATE_PREVIOUS_YEAR.TERM_CODE_KEY = [Enroll_Snapshot].[dbo].[DailyStudent].TERM_CODE_KEY
+WHERE MinSnapshotMonthDay <= @Date 
+and Format(SnapshotDate, 'MM-dd') in 
+(Select Format(max(SnapshotDate), 'MM-dd') from [Enroll_Snapshot].[dbo].[DailyStudent]
+where Format(SnapshotDate, 'MM-dd') <= @Date and TERM_CODE_KEY = @UpcomingTerm - 100)
+
+UNION 
+
+SELECT distinct *
+FROM [Enroll_Snapshot].[dbo].[DailyStudent]
+WHERE TERM_CODE_KEY = @UpcomingTerm and Format(SnapshotDate, 'MM-dd') = @Date
+),
+
+--merge major and second_major in as_admission_application into one column
+UG_ADMITS_UnionMajors AS (
+SELECT [PIDM_KEY]
+        , [ACADEMIC_YEAR_DESC]
+        , [ACADEMIC_TERM]
+        , [ACADEMIC_TERM_DESC]
+        , [APPLICATION_NUMBER]
+        , [LATEST_DECISION]
+        , [LATEST_DECISION_DATE]
+        , [STUDENT_LEVEL]
+        , [STUDENT_POPULATION]
+        , ISNULL([CAMPUS_DESC], [SITE_DESC]) AS CAMPUS
+        , [COLLEGE]
+        , [COLLEGE_DESC]
+        , [DEGREE]
+        , [MAJOR]
+        , [MAJOR_DESC]
+        , [DEPARTMENT1]
+        , [DEPARTMENT_DESC1]
+FROM [BannerReporting].[dbo].[AS_ADMISSIONS_APPLICATION]
+WHERE [LATEST_DECISION] In ('09','02')
+        AND [STUDENT_LEVEL]= 'UG'
+ 
+UNION SELECT [PIDM_KEY]
+        , [ACADEMIC_YEAR_DESC]
+        , [ACADEMIC_TERM]
+        , [ACADEMIC_TERM_DESC]
+        , [APPLICATION_NUMBER]
+        , [LATEST_DECISION]
+        , [LATEST_DECISION_DATE]
+        , [STUDENT_LEVEL]
+        , [STUDENT_POPULATION]
+        , ISNULL([CAMPUS_DESC], [SITE_DESC]) AS CAMPUS
+        , [COLLEGE]
+        , [COLLEGE_DESC]
+        , [DEGREE]
+        , [SECOND_MAJOR]
+        , [SECOND_MAJOR_DESC]
+        , [DEPARTMENT1]
+        , [DEPARTMENT_DESC1]
+FROM [BannerReporting].[dbo].[AS_ADMISSIONS_APPLICATION]
+WHERE [LATEST_DECISION] In ('09','02')
+        AND [STUDENT_LEVEL]= 'UG'
+        AND [SECOND_MAJOR] is not null
+),
+ 
+--get maximum application number by pidm_key, academic_term and student level
+UG_ADMITS_MaxAppNum AS (
+SELECT PIDM_KEY
+        , ACADEMIC_TERM
+        , Max(APPLICATION_NUMBER) AS MaxOfAppNum
+        , STUDENT_LEVEL
+FROM [UG_ADMITS_UnionMajors]
+GROUP BY PIDM_KEY, ACADEMIC_TERM, STUDENT_LEVEL
+),
+ 
+--count the number of majors that student apply in their most cent application
+UG_ADMITS_CountMajor AS (
+SELECT [UG_ADMITS_UnionMajors].PIDM_KEY
+        , [UG_ADMITS_UnionMajors].ACADEMIC_TERM AS TERM_KEY
+        , [UG_ADMITS_UnionMajors].APPLICATION_NUMBER
+        , Count([UG_ADMITS_UnionMajors].MAJOR) AS CountOfMAJOR
+FROM [UG_ADMITS_UnionMajors]
+    INNER JOIN [UG_ADMITS_MaxAppNum]
+    ON ([UG_ADMITS_UnionMajors].APPLICATION_NUMBER=[UG_ADMITS_MaxAppNum].MaxOfAppNum)
+    AND ([UG_ADMITS_UnionMajors].ACADEMIC_TERM=[UG_ADMITS_MaxAppNum].ACADEMIC_TERM)
+    AND ([UG_ADMITS_UnionMajors].PIDM_KEY=[UG_ADMITS_MaxAppNum].PIDM_KEY)
+GROUP BY [UG_ADMITS_UnionMajors].PIDM_KEY
+        , [UG_ADMITS_UnionMajors].ACADEMIC_TERM
+        , [UG_ADMITS_UnionMajors].APPLICATION_NUMBER
+),
+ 
+--Find the post application major
+UG_ADMITS_AdmitEnroll_Compare AS (
+SELECT DISTINCT
+    [UG_ADMITS_UnionMajors].PIDM_KEY,
+    [UG_ADMITS_UnionMajors].ACADEMIC_TERM,
+    [UG_ADMITS_UnionMajors].ACADEMIC_TERM_DESC,
+    [UG_ADMITS_UnionMajors].STUDENT_LEVEL,
+    CASE 
+        WHEN [UG_ADMITS_UnionMajors].[STUDENT_POPULATION] = 'N' THEN 'New First-time'
+        WHEN [UG_ADMITS_UnionMajors].[STUDENT_POPULATION] in ('T', 'W') THEN 'New Transfer'
+        WHEN [UG_ADMITS_UnionMajors].[STUDENT_POPULATION] in ('B', 'F', 'R', '6', '7') THEN 'Returning'
+        WHEN [UG_ADMITS_UnionMajors].[STUDENT_POPULATION] = 'V' THEN 'Visiting'
+        WHEN [UG_ADMITS_UnionMajors].[STUDENT_POPULATION] in ('2', 'I', 'O', 'S') THEN 'Others'
+        ELSE 'Others'
+    END AS STUDENT_TYPE,
+    CASE 
+        WHEN [Daily_Snapshot].[TERM_CODE_KEY] = @UpcomingTerm - 100 AND 
+            ([Daily_Snapshot].[CURRENTLY_REGISTERED] = 'Y' or [Daily_Snapshot].[CURRENTLY_REGISTERED] is null) THEN 1
+        WHEN [Daily_Snapshot].[TERM_CODE_KEY] = @UpcomingTerm AND 
+            [Daily_Snapshot].[CURRENTLY_REGISTERED] = 'Y' THEN 1
+        ELSE 0
+    END AS CURRENTLY_REGISTERED,
+    [DAILY_SNAPSHOT].[CURRENTLY_REGISTERED] as cr,
+    IIf(
+        [Daily_Snapshot].[PIDM_KEY] Is Not Null,
+        [Enroll_Snapshot].[dbo].[DailyStudentCurriculum].[MAJR_CODE],
+        ISNULL([BannerReporting].[dbo].[AS_Z_STUDENT_DATA_CURRICULUM].[MAJR1_1_CODE],[UG_ADMITS_UnionMajors].[MAJOR])
+    ) AS PostApp_Major,
+    IIf(
+        [Daily_Snapshot].PIDM_KEY Is Not Null,
+        [Enroll_Snapshot].[dbo].[DailyStudentCurriculum].DEPT_CODE,
+        ISNULL([BannerReporting].[dbo].[AS_Z_STUDENT_DATA_CURRICULUM].DEPT1_1_CODE,[UG_ADMITS_UnionMajors].DEPARTMENT1)
+    ) AS PostApp_Dept,
+    IIf(
+        [Daily_Snapshot].PIDM_KEY Is Not Null,
+        [Enroll_Snapshot].[dbo].[DailyStudentCurriculum].COLL_CODE,
+        ISNULL([BannerReporting].[dbo].[AS_Z_STUDENT_DATA_CURRICULUM].COLL1_1_CODE,[UG_ADMITS_UnionMajors].COLLEGE)
+    ) AS PostApp_College,
+UPPER(
+    CASE
+        WHEN ISNULL([Daily_Snapshot].STU_CAMP_DESC, '') <> '' THEN [Daily_Snapshot].STU_CAMP_DESC
+        WHEN ISNULL([BannerReporting].[dbo].[AS_Z_STUDENT_DATA].CAMP_DESC, '') <> '' THEN [BannerReporting].[dbo].[AS_Z_STUDENT_DATA].CAMP_DESC
+        ELSE [UG_ADMITS_UnionMajors].CAMPUS
+    END
+) AS PostApp_Campus,
+    [BannerReporting].[dbo].[AS_Z_PERSON].CITIZENSHIP_IND,
+    [UG_ADMITS_UnionMajors].APPLICATION_NUMBER,
+    [UG_ADMITS_UnionMajors].MAJOR AS App_Major,
+    [UG_ADMITS_UnionMajors].MAJOR_DESC AS App_Major_Desc,
+    [UG_ADMITS_UnionMajors].DEPARTMENT_DESC1 AS App_Dept,
+    [UG_ADMITS_UnionMajors].COLLEGE_DESC AS App_Coll,
+    [UG_ADMITS_UnionMajors].CAMPUS AS App_Campus,
+    [UG_ADMITS_CountMajor].CountOfMAJOR,
+    IIf(
+        IIf(
+            [Daily_Snapshot].[PIDM_KEY] Is Not Null,
+            [Enroll_Snapshot].[dbo].[DailyStudentCurriculum].[MAJR_CODE],
+            ISNULL([BannerReporting].[dbo].[AS_Z_STUDENT_DATA_CURRICULUM].[MAJR1_1_CODE],[UG_ADMITS_UnionMajors].[MAJOR])
+        )=[MAJOR],
+        'Y',
+        'N'
+    ) AS Keep_Major_Ind  
+FROM
+    [UG_ADMITS_CountMajor]
+INNER JOIN
+    (
+        (
+            (
+                (
+                    (
+                        [UG_ADMITS_UnionMajors]
+                        LEFT JOIN [BannerReporting].[dbo].[AS_Z_STUDENT_DATA]
+                        ON (
+                            [UG_ADMITS_UnionMajors].PIDM_KEY = [BannerReporting].[dbo].[AS_Z_STUDENT_DATA].PIDM_KEY
+                            AND [UG_ADMITS_UnionMajors].ACADEMIC_TERM = [BannerReporting].[dbo].[AS_Z_STUDENT_DATA].TERM_CODE
+                        )
+                    )
+                    LEFT JOIN [Daily_Snapshot]
+                    ON (
+                        [UG_ADMITS_UnionMajors].PIDM_KEY = [Daily_Snapshot].PIDM_KEY
+                        AND [UG_ADMITS_UnionMajors].ACADEMIC_TERM = [Daily_Snapshot].TERM_CODE_KEY
+                    )
+                )
+                LEFT JOIN [Enroll_Snapshot].[dbo].[DailyStudentCurriculum]
+                ON (
+                    [Daily_Snapshot].SnapshotDate = [Enroll_Snapshot].[dbo].[DailyStudentCurriculum].SnapshotDate
+                    AND [Daily_Snapshot].TERM_CODE_KEY = [Enroll_Snapshot].[dbo].[DailyStudentCurriculum].TERM_CODE_KEY
+                    AND [Daily_Snapshot].PIDM_KEY = [Enroll_Snapshot].[dbo].[DailyStudentCurriculum].PIDM_KEY
+                )
+            )
+            LEFT JOIN [BannerReporting].[dbo].[AS_Z_STUDENT_DATA_CURRICULUM]
+            ON (
+                [UG_ADMITS_UnionMajors].PIDM_KEY = [BannerReporting].[dbo].[AS_Z_STUDENT_DATA_CURRICULUM].PIDM_KEY
+                AND [UG_ADMITS_UnionMajors].ACADEMIC_TERM = [BannerReporting].[dbo].[AS_Z_STUDENT_DATA_CURRICULUM].TERM_CODE
+            )
+        )
+        LEFT JOIN [BannerReporting].[dbo].[AS_Z_PERSON]
+        ON [UG_ADMITS_UnionMajors].PIDM_KEY = [BannerReporting].[dbo].[AS_Z_PERSON].PIDM_KEY
+    )
+    ON (
+        [UG_ADMITS_CountMajor].PIDM_KEY = [UG_ADMITS_UnionMajors].PIDM_KEY
+        AND [UG_ADMITS_CountMajor].TERM_KEY = [UG_ADMITS_UnionMajors].ACADEMIC_TERM
+        AND [UG_ADMITS_CountMajor].APPLICATION_NUMBER = [UG_ADMITS_UnionMajors].APPLICATION_NUMBER
+    )
+WHERE
+    (
+        (
+            ([UG_ADMITS_UnionMajors].ACADEMIC_TERM)= @UpcomingTerm - 100
+            AND ([UG_ADMITS_UnionMajors].STUDENT_LEVEL)='UG'
+            AND ([UG_ADMITS_UnionMajors].MAJOR_DESC) Is Not Null
+            AND ([UG_ADMITS_UnionMajors].LATEST_DECISION_DATE) < CAST(CONCAT(@Date, '-',
+                                        IIF(@UpcomingTerm - 100 like '%10', LEFT(@UpcomingTerm - 100, 4) -1, LEFT(@UpcomingTerm - 100, 4))) as date
+        )
+        OR
+        (
+            ([UG_ADMITS_UnionMajors].ACADEMIC_TERM)= @UpcomingTerm
+            AND ([UG_ADMITS_UnionMajors].STUDENT_LEVEL)='UG'
+            AND ([UG_ADMITS_UnionMajors].MAJOR_DESC) Is Not Null
+            AND ([UG_ADMITS_UnionMajors].LATEST_DECISION_DATE) < CAST(CONCAT(@Date, '-', 
+                                        IIF(@UpcomingTerm like '%10', LEFT(@UpcomingTerm, 4) -1, LEFT(@UpcomingTerm, 4))) AS date
+        )
+    )
+)
+    ))
+--citizen
+Select 
+        ACADEMIC_TERM
+        ,ACADEMIC_TERM_DESC
+        ,STUDENT_LEVEL
+        -- ,STUDENT_TYPE
+        --,PostApp_Major
+        ,IsNull(SZVIRMD_MAJR_DESC, STVMAJR_DESC) AS PostApp_Major_Desc
+        ,CASE 
+            WHEN ISNULL(SZVIRMD_XWLK_DEPT_DESC, STVDEPT_DESC) = 'Kinesiology, Nutrition & Rec' THEN 'Allied Hlth, Kines & Sport Sci'
+            ELSE ISNULL(SZVIRMD_XWLK_DEPT_DESC, STVDEPT_DESC)
+        END AS PostApp_Dept_Desc
+        ,STVCOLL_DESC AS PostApp_Coll
+        ,COUNT(DISTINCT PIDM_KEY) as Admits
+        ,SUM(CURRENTLY_REGISTERED) as Enrolled
+        ,IIF(GROUPING(STVCOLL_DESC) = 1, 'Grand Total', STVCOLL_DESC) As PostApp_Coll_Agg
+        ,CASE 
+            WHEN GROUPING(STVCOLL_DESC) = 1 AND GROUPING(SZVIRMD_XWLK_DEPT_DESC) = 1 THEN 'All Dept'
+            WHEN GROUPING(SZVIRMD_XWLK_DEPT_DESC) = 1 THEN 'SubCollege'
+            ELSE CASE 
+            WHEN ISNULL(SZVIRMD_XWLK_DEPT_DESC, STVDEPT_DESC) = 'Kinesiology, Nutrition & Rec' THEN 'Allied Hlth, Kines & Sport Sci'
+            ELSE ISNULL(SZVIRMD_XWLK_DEPT_DESC, STVDEPT_DESC)
+            END
+        END AS PostApp_Dept_Agg
+        ,CASE 
+            WHEN GROUPING(STVCOLL_DESC) = 1 AND GROUPING(SZVIRMD_XWLK_DEPT_DESC) = 1 THEN 'All Major'
+            WHEN GROUPING(SZVIRMD_XWLK_DEPT_DESC) = 1 THEN 'SubDept'
+            WHEN GROUPING(SZVIRMD_MAJR_DESC) = 1 THEN 'SubMajor'
+            ELSE IsNull(SZVIRMD_MAJR_DESC, STVMAJR_DESC)
+        END AS PostApp_Major_Agg
+        -- ,PostApp_Campus
+        ,IIF(CITIZENSHIP_IND = 'Y', 'Citizen', 'Non-citizen') as CITIZENSHIP
+from UG_ADMITS_AdmitEnroll_Compare
+left join [BannerReporting].[dbo].[AS_Z_IR_Major_Dept_Xwlk] 
+on [BannerReporting].[dbo].[AS_Z_IR_Major_Dept_Xwlk].SZVIRMD_MAJR_CODE = [UG_ADMITS_AdmitEnroll_Compare].PostApp_Major
+left join [BannerReporting].[dbo].[AS_CODES_MAJR] 
+on [BannerReporting].[dbo].[AS_CODES_MAJR].STVMAJR_CODE = [UG_ADMITS_AdmitEnroll_Compare].PostApp_Major
+left join [BannerReporting].[dbo].[AS_CODES_DEPT] 
+on [BannerReporting].[dbo].[AS_CODES_DEPT].STVDEPT_CODE = [UG_ADMITS_AdmitEnroll_Compare].PostApp_Dept
+left join [BannerReporting].[dbo].[AS_CODES_COLL] 
+on [BannerReporting].[dbo].[AS_Z_IR_Major_Dept_Xwlk].SZVIRMD_COLL_OF_DEPT = [BannerReporting].[dbo].[AS_CODES_COLL].STVCOLL_CODE
+or [BannerReporting].[dbo].[AS_CODES_COLL].STVCOLL_CODE = [UG_ADMITS_AdmitEnroll_Compare].PostApp_College
+GROUP BY 
+GROUPING SETS (
+    ( 
+    ACADEMIC_TERM
+        ,ACADEMIC_TERM_DESC
+        ,STUDENT_LEVEL
+        ,CITIZENSHIP_IND
+        ,SZVIRMD_MAJR_DESC
+        ,STVMAJR_DESC
+        ,SZVIRMD_XWLK_DEPT_DESC
+        ,STVDEPT_DESC
+        ,STVCOLL_DESC
+),
+(    ACADEMIC_TERM
+        ,ACADEMIC_TERM_DESC
+        ,STUDENT_LEVEL
+        ,CITIZENSHIP_IND
+        ,SZVIRMD_XWLK_DEPT_DESC
+        ,STVDEPT_DESC
+        ,STVCOLL_DESC
+),
+(    ACADEMIC_TERM
+        ,ACADEMIC_TERM_DESC
+        ,STUDENT_LEVEL
+        ,CITIZENSHIP_IND
+        ,STVCOLL_DESC
+),
+(   ACADEMIC_TERM
+        ,ACADEMIC_TERM_DESC
+        ,STUDENT_LEVEL
+        ,CITIZENSHIP_IND
+)
+)
+
+
+--     --total
+-- Select 
+--         ACADEMIC_TERM
+--         ,ACADEMIC_TERM_DESC
+--         ,STUDENT_LEVEL
+--         -- ,STUDENT_TYPE
+--         --,PostApp_Major
+--         ,IsNull(SZVIRMD_MAJR_DESC, STVMAJR_DESC) AS PostApp_Major_Desc
+--         ,CASE 
+--             WHEN ISNULL(SZVIRMD_XWLK_DEPT_DESC, STVDEPT_DESC) = 'Kinesiology, Nutrition & Rec' THEN 'Allied Hlth, Kines & Sport Sci'
+--             ELSE ISNULL(SZVIRMD_XWLK_DEPT_DESC, STVDEPT_DESC)
+--         END AS PostApp_Dept_Desc
+--         ,STVCOLL_DESC AS PostApp_Coll
+--         ,COUNT(DISTINCT PIDM_KEY) as Admits
+--         ,SUM(CURRENTLY_REGISTERED) as Enrolled
+--         ,IIF(GROUPING(STVCOLL_DESC) = 1, 'Grand Total', STVCOLL_DESC) As PostApp_Coll_Agg
+--         ,CASE 
+--             WHEN GROUPING(STVCOLL_DESC) = 1 AND GROUPING(SZVIRMD_XWLK_DEPT_DESC) = 1 THEN 'All Dept'
+--             WHEN GROUPING(SZVIRMD_XWLK_DEPT_DESC) = 1 THEN 'SubCollege'
+--             ELSE CASE 
+--             WHEN ISNULL(SZVIRMD_XWLK_DEPT_DESC, STVDEPT_DESC) = 'Kinesiology, Nutrition & Rec' THEN 'Allied Hlth, Kines & Sport Sci'
+--             ELSE ISNULL(SZVIRMD_XWLK_DEPT_DESC, STVDEPT_DESC)
+--             END
+--         END AS PostApp_Dept_Agg
+--         ,CASE 
+--             WHEN GROUPING(STVCOLL_DESC) = 1 AND GROUPING(SZVIRMD_XWLK_DEPT_DESC) = 1 THEN 'All Major'
+--             WHEN GROUPING(SZVIRMD_XWLK_DEPT_DESC) = 1 THEN 'SubDept'
+--             WHEN GROUPING(SZVIRMD_MAJR_DESC) = 1 THEN 'SubMajor'
+--             ELSE IsNull(SZVIRMD_MAJR_DESC, STVMAJR_DESC)
+--         END AS PostApp_Major_Agg
+--         -- ,PostApp_Campus
+--         -- ,IIF(CITIZENSHIP_IND = 'Y', 'Citizen', 'Non-citizen') as CITIZENSHIP
+-- from UG_ADMITS_AdmitEnroll_Compare
+-- left join [BannerReporting].[dbo].[AS_Z_IR_Major_Dept_Xwlk] 
+-- on [BannerReporting].[dbo].[AS_Z_IR_Major_Dept_Xwlk].SZVIRMD_MAJR_CODE = [UG_ADMITS_AdmitEnroll_Compare].PostApp_Major
+-- left join [BannerReporting].[dbo].[AS_CODES_MAJR] 
+-- on [BannerReporting].[dbo].[AS_CODES_MAJR].STVMAJR_CODE = [UG_ADMITS_AdmitEnroll_Compare].PostApp_Major
+-- left join [BannerReporting].[dbo].[AS_CODES_DEPT] 
+-- on [BannerReporting].[dbo].[AS_CODES_DEPT].STVDEPT_CODE = [UG_ADMITS_AdmitEnroll_Compare].PostApp_Dept
+-- left join [BannerReporting].[dbo].[AS_CODES_COLL] 
+-- on [BannerReporting].[dbo].[AS_Z_IR_Major_Dept_Xwlk].SZVIRMD_COLL_OF_DEPT = [BannerReporting].[dbo].[AS_CODES_COLL].STVCOLL_CODE
+-- or [BannerReporting].[dbo].[AS_CODES_COLL].STVCOLL_CODE = [UG_ADMITS_AdmitEnroll_Compare].PostApp_College
+-- GROUP BY 
+-- GROUPING SETS (
+--     ( 
+--     ACADEMIC_TERM
+--         ,ACADEMIC_TERM_DESC
+--         ,STUDENT_LEVEL
+--         ,PostApp_Major
+--         ,SZVIRMD_MAJR_DESC
+--         ,STVMAJR_DESC
+--         ,SZVIRMD_XWLK_DEPT_DESC
+--         ,STVDEPT_DESC
+--         ,STVCOLL_DESC
+-- ),
+-- (    ACADEMIC_TERM
+--         ,ACADEMIC_TERM_DESC
+--         ,STUDENT_LEVEL
+--         ,SZVIRMD_XWLK_DEPT_DESC
+--         ,STVDEPT_DESC
+--         ,STVCOLL_DESC
+-- ),
+-- (    ACADEMIC_TERM
+--         ,ACADEMIC_TERM_DESC
+--         ,STUDENT_LEVEL
+--         ,STVCOLL_DESC
+-- ),
+-- (   ACADEMIC_TERM
+--         ,ACADEMIC_TERM_DESC
+--         ,STUDENT_LEVEL
+-- )
+-- )
+
+-- --student type
+-- Select 
+--         ACADEMIC_TERM
+--         ,ACADEMIC_TERM_DESC
+--         ,STUDENT_LEVEL
+--         ,STUDENT_TYPE
+--         --,PostApp_Major
+--         ,IsNull(SZVIRMD_MAJR_DESC, STVMAJR_DESC) AS PostApp_Major_Desc
+--         ,CASE 
+--             WHEN ISNULL(SZVIRMD_XWLK_DEPT_DESC, STVDEPT_DESC) = 'Kinesiology, Nutrition & Rec' THEN 'Allied Hlth, Kines & Sport Sci'
+--             ELSE ISNULL(SZVIRMD_XWLK_DEPT_DESC, STVDEPT_DESC)
+--         END AS PostApp_Dept_Desc
+--         ,STVCOLL_DESC AS PostApp_Coll
+--         ,COUNT(DISTINCT PIDM_KEY) as Admits
+--         ,SUM(CURRENTLY_REGISTERED) as Enrolled
+--         ,IIF(GROUPING(STVCOLL_DESC) = 1, 'Grand Total', STVCOLL_DESC) As PostApp_Coll_Agg
+--         ,CASE 
+--             WHEN GROUPING(STVCOLL_DESC) = 1 AND GROUPING(SZVIRMD_XWLK_DEPT_DESC) = 1 THEN 'All Dept'
+--             WHEN GROUPING(SZVIRMD_XWLK_DEPT_DESC) = 1 THEN 'SubCollege'
+--             ELSE CASE 
+--             WHEN ISNULL(SZVIRMD_XWLK_DEPT_DESC, STVDEPT_DESC) = 'Kinesiology, Nutrition & Rec' THEN 'Allied Hlth, Kines & Sport Sci'
+--             ELSE ISNULL(SZVIRMD_XWLK_DEPT_DESC, STVDEPT_DESC)
+--             END
+--         END AS PostApp_Dept_Agg
+--         ,CASE 
+--             WHEN GROUPING(STVCOLL_DESC) = 1 AND GROUPING(SZVIRMD_XWLK_DEPT_DESC) = 1 THEN 'All Major'
+--             WHEN GROUPING(SZVIRMD_XWLK_DEPT_DESC) = 1 THEN 'SubDept'
+--             WHEN GROUPING(SZVIRMD_MAJR_DESC) = 1 THEN 'SubMajor'
+--             ELSE IsNull(SZVIRMD_MAJR_DESC, STVMAJR_DESC)
+--         END AS PostApp_Major_Agg
+--         -- ,PostApp_Campus
+--         --,IIF(CITIZENSHIP_IND = 'Y', 'Citizen', 'Non-citizen') as CITIZENSHIP
+-- from UG_ADMITS_AdmitEnroll_Compare
+-- left join [BannerReporting].[dbo].[AS_Z_IR_Major_Dept_Xwlk] 
+-- on [BannerReporting].[dbo].[AS_Z_IR_Major_Dept_Xwlk].SZVIRMD_MAJR_CODE = [UG_ADMITS_AdmitEnroll_Compare].PostApp_Major
+-- left join [BannerReporting].[dbo].[AS_CODES_MAJR] 
+-- on [BannerReporting].[dbo].[AS_CODES_MAJR].STVMAJR_CODE = [UG_ADMITS_AdmitEnroll_Compare].PostApp_Major
+-- left join [BannerReporting].[dbo].[AS_CODES_DEPT] 
+-- on [BannerReporting].[dbo].[AS_CODES_DEPT].STVDEPT_CODE = [UG_ADMITS_AdmitEnroll_Compare].PostApp_Dept
+-- left join [BannerReporting].[dbo].[AS_CODES_COLL] 
+-- on [BannerReporting].[dbo].[AS_Z_IR_Major_Dept_Xwlk].SZVIRMD_COLL_OF_DEPT = [BannerReporting].[dbo].[AS_CODES_COLL].STVCOLL_CODE
+-- or [BannerReporting].[dbo].[AS_CODES_COLL].STVCOLL_CODE = [UG_ADMITS_AdmitEnroll_Compare].PostApp_College
+-- GROUP BY 
+-- GROUPING SETS (
+--     ( 
+--     ACADEMIC_TERM
+--         ,ACADEMIC_TERM_DESC
+--         ,STUDENT_LEVEL
+--         ,STUDENT_TYPE
+--         ,SZVIRMD_MAJR_DESC
+--         ,STVMAJR_DESC
+--         ,SZVIRMD_XWLK_DEPT_DESC
+--         ,STVDEPT_DESC
+--         ,STVCOLL_DESC
+-- ),
+-- (    ACADEMIC_TERM
+--         ,ACADEMIC_TERM_DESC
+--         ,STUDENT_LEVEL
+--         ,STUDENT_TYPE
+--         ,SZVIRMD_XWLK_DEPT_DESC
+--         ,STVDEPT_DESC
+--         ,STVCOLL_DESC
+-- ),
+-- (    ACADEMIC_TERM
+--         ,ACADEMIC_TERM_DESC
+--         ,STUDENT_LEVEL
+--         ,STUDENT_TYPE
+--         ,STVCOLL_DESC
+-- ),
+-- (   ACADEMIC_TERM
+--         ,ACADEMIC_TERM_DESC
+--         ,STUDENT_LEVEL
+--         ,STUDENT_TYPE
+-- )
+-- )
+
+-- --campus
+-- Select 
+--         ACADEMIC_TERM
+--         ,ACADEMIC_TERM_DESC
+--         ,STUDENT_LEVEL
+--         --,STUDENT_TYPE
+--         --,PostApp_Major
+--         ,IsNull(SZVIRMD_MAJR_DESC, STVMAJR_DESC) AS PostApp_Major_Desc
+--         ,CASE 
+--             WHEN ISNULL(SZVIRMD_XWLK_DEPT_DESC, STVDEPT_DESC) = 'Kinesiology, Nutrition & Rec' THEN 'Allied Hlth, Kines & Sport Sci'
+--             ELSE ISNULL(SZVIRMD_XWLK_DEPT_DESC, STVDEPT_DESC)
+--         END AS PostApp_Dept_Desc
+--         ,STVCOLL_DESC AS PostApp_Coll
+--         ,COUNT(DISTINCT PIDM_KEY) as Admits
+--         ,SUM(CURRENTLY_REGISTERED) as Enrolled
+--         ,IIF(GROUPING(STVCOLL_DESC) = 1, 'Grand Total', STVCOLL_DESC) As PostApp_Coll_Agg
+--         ,CASE 
+--             WHEN GROUPING(STVCOLL_DESC) = 1 AND GROUPING(SZVIRMD_XWLK_DEPT_DESC) = 1 THEN 'All Dept'
+--             WHEN GROUPING(SZVIRMD_XWLK_DEPT_DESC) = 1 THEN 'SubCollege'
+--             ELSE CASE 
+--             WHEN ISNULL(SZVIRMD_XWLK_DEPT_DESC, STVDEPT_DESC) = 'Kinesiology, Nutrition & Rec' THEN 'Allied Hlth, Kines & Sport Sci'
+--             ELSE ISNULL(SZVIRMD_XWLK_DEPT_DESC, STVDEPT_DESC)
+--             END
+--         END AS PostApp_Dept_Agg
+--         ,CASE 
+--             WHEN GROUPING(STVCOLL_DESC) = 1 AND GROUPING(SZVIRMD_XWLK_DEPT_DESC) = 1 THEN 'All Major'
+--             WHEN GROUPING(SZVIRMD_XWLK_DEPT_DESC) = 1 THEN 'SubDept'
+--             WHEN GROUPING(SZVIRMD_MAJR_DESC) = 1 THEN 'SubMajor'
+--             ELSE IsNull(SZVIRMD_MAJR_DESC, STVMAJR_DESC)
+--         END AS PostApp_Major_Agg
+--         ,PostApp_Campus
+--         --,IIF(CITIZENSHIP_IND = 'Y', 'Citizen', 'Non-citizen') as CITIZENSHIP
+-- from UG_ADMITS_AdmitEnroll_Compare
+-- left join [BannerReporting].[dbo].[AS_Z_IR_Major_Dept_Xwlk] 
+-- on [BannerReporting].[dbo].[AS_Z_IR_Major_Dept_Xwlk].SZVIRMD_MAJR_CODE = [UG_ADMITS_AdmitEnroll_Compare].PostApp_Major
+-- left join [BannerReporting].[dbo].[AS_CODES_MAJR] 
+-- on [BannerReporting].[dbo].[AS_CODES_MAJR].STVMAJR_CODE = [UG_ADMITS_AdmitEnroll_Compare].PostApp_Major
+-- left join [BannerReporting].[dbo].[AS_CODES_DEPT] 
+-- on [BannerReporting].[dbo].[AS_CODES_DEPT].STVDEPT_CODE = [UG_ADMITS_AdmitEnroll_Compare].PostApp_Dept
+-- left join [BannerReporting].[dbo].[AS_CODES_COLL] 
+-- on [BannerReporting].[dbo].[AS_Z_IR_Major_Dept_Xwlk].SZVIRMD_COLL_OF_DEPT = [BannerReporting].[dbo].[AS_CODES_COLL].STVCOLL_CODE
+-- or [BannerReporting].[dbo].[AS_CODES_COLL].STVCOLL_CODE = [UG_ADMITS_AdmitEnroll_Compare].PostApp_College
+-- GROUP BY 
+-- GROUPING SETS (
+--     ( 
+--     ACADEMIC_TERM
+--         ,ACADEMIC_TERM_DESC
+--         ,STUDENT_LEVEL
+--         ,PostApp_Campus
+--         ,SZVIRMD_MAJR_DESC
+--         ,STVMAJR_DESC
+--         ,SZVIRMD_XWLK_DEPT_DESC
+--         ,STVDEPT_DESC
+--         ,STVCOLL_DESC
+-- ),
+-- (    ACADEMIC_TERM
+--         ,ACADEMIC_TERM_DESC
+--         ,STUDENT_LEVEL
+--         ,PostApp_Campus
+--         ,SZVIRMD_XWLK_DEPT_DESC
+--         ,STVDEPT_DESC
+--         ,STVCOLL_DESC
+-- ),
+-- (    ACADEMIC_TERM
+--         ,ACADEMIC_TERM_DESC
+--         ,PostApp_Campus
+--         ,STUDENT_TYPE
+--         ,STVCOLL_DESC
+-- ),
+-- (   ACADEMIC_TERM
+--         ,ACADEMIC_TERM_DESC
+--         ,PostApp_Campus
+--         ,STUDENT_TYPE
+-- )
+-- )
